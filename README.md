@@ -3,7 +3,7 @@
 Khuôn dự án backend **Go + [chi](https://github.com/go-chi/chi)** (phụ thuộc duy nhất là router; phần còn lại dùng thư viện chuẩn), được xếp theo một tư duy cấu trúc thư mục rõ ràng:
 
 1. **Hạ tầng tách khỏi nghiệp vụ**: `framework/` và `modules/`. Phụ thuộc chỉ đi một chiều.
-2. **Hạ tầng xếp theo năng lực, rồi mới tới nhà cung cấp**: `config/env`, `pubsub/memory`… Thêm Vault hay Kafka chỉ là thêm một thư mục anh em.
+2. **Hạ tầng xếp theo năng lực, rồi mới tới nhà cung cấp**: `config/{env,vault}`, `pubsub/memory`… Thêm Kafka hay Postgres chỉ là thêm một thư mục anh em.
 3. **Mỗi module là một lát dọc**: `dto / handler / service / repo / model`. Có module mẫu `hello` để copy.
 4. **Tên file cho biết tầng và use case**: `routes/0_init.go`, `routes/<module>.go`.
 5. **Mỗi loại code một chỗ**: code viết tay, code sinh tự động, tích hợp bên ngoài.
@@ -29,6 +29,8 @@ make check                            # gofmt + go vet + go test -race (cổng t
 | `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
 | `AUTH_TOKEN` | (bắt buộc) | ≥ 16 ký tự. Thiếu hoặc sai thì app **dừng ngay lúc khởi động** và báo hết các khoá có vấn đề |
 
+Các biến trên lấy từ **biến môi trường**, hoặc từ **Vault** nếu có đặt `VAULT_ADDR` (xem mục *Luồng cấu hình*).
+
 ---
 
 ## Cấu trúc thư mục
@@ -53,10 +55,13 @@ go-modular-template/
 │   │   ├── errs/errs.go            #     kiểu lỗi chuẩn: Kind, Key, Msg, Retriable
 │   │   └── event/event.go          #     phong bì event: ID, Name, Key (giữ thứ tự), Data, Attempt
 │   ├── config/
-│   │   ├── config.go               #   struct Config có kiểu + Load(Source): validate 1 lần, báo hết lỗi
-│   │   ├── config_test.go
+│   │   ├── config.go               #   interface Source + struct Config có kiểu + Load: validate 1 lần, báo hết lỗi
+│   │   ├── chain.go                #   Chain{a, b}: hỏi a trước, thiếu mới hỏi b
+│   │   ├── config_test.go  chain_test.go
 │   │   ├── env/env.go              #   nhà cung cấp: biến môi trường
-│   │   └── vault/                  #   (thêm khi cần) nhà cung cấp: Vault — cùng interface Source
+│   │   └── vault/                  #   nhà cung cấp: Vault KV v2 qua HTTP API (stdlib)
+│   │       ├── vault.go            #     token hoặc AppRole · đọc theo folder · path sau đè path trước · TLS kiểm thật
+│   │       └── vault_test.go       #     Vault giả bằng httptest: lớp, AppRole, 404≠403, TLS, cấm http ra ngoài
 │   ├── log/log.go                  #   slog JSON ra stdout
 │   ├── db/                         #   (thêm khi cần) lưu BỀN: postgres/, mongo/
 │   ├── dbmem/
@@ -109,6 +114,56 @@ Những dòng ghi **(thêm khi cần)** chưa có trong repo. Chúng chỉ đán
 
 ---
 
+## Luồng cấu hình (env / Vault)
+
+```
+main.configSource()
+  ├─ không có VAULT_ADDR ─► env.Source                                   (dev: chỉ biến môi trường)
+  └─ có VAULT_ADDR ─► vault.OptionsFrom(env)  đọc VAULT_*, báo hết khoá thiếu
+        └─► vault.New
+              ├─ đăng nhập: VAULT_TOKEN  hoặc  AppRole (VAULT_ROLE_ID + VAULT_SECRET_ID → client_token)
+              ├─ đọc KV v2 theo thứ tự VAULT_PATHS: GET /v1/<mount>/data/<path>  (1 GET / path, path sau ĐÈ path trước)
+              └─ trả ảnh chụp map[key]value (token không giữ lại)
+     ─► config.Chain{vault, env}   Vault thắng; khoá Vault không có mới lấy từ env
+  ─► config.Load(...)  → struct Config có kiểu, validate một lần
+```
+
+| Biến | Ý nghĩa |
+|---|---|
+| `VAULT_ADDR` | `https://vault.example.com:8200`. `http://` chỉ được chấp nhận với localhost |
+| `VAULT_PATHS` | danh sách path cách nhau dấu phẩy, đọc theo thứ tự, ví dụ `shared,go-modular-template` |
+| `VAULT_KV_MOUNT` | mount của KV v2, mặc định `secret` |
+| `VAULT_TOKEN` | đăng nhập bằng token có sẵn, **hoặc** |
+| `VAULT_ROLE_ID` + `VAULT_SECRET_ID` | đăng nhập bằng AppRole (khuyên dùng cho service) |
+| `VAULT_CACERT` | file PEM của CA nội bộ; để trống thì dùng CA của hệ thống |
+
+Sắp xếp secret trong Vault (KV v2, mount `secret`):
+```
+secret/shared                → LOG_LEVEL, ... (dùng chung nhiều service)
+secret/go-modular-template   → AUTH_TOKEN, HTTP_ADDR, ... (riêng service này, đè shared)
+```
+Policy tối thiểu cho role của service: chỉ `read` đúng các path trên, ví dụ `path "secret/data/go-modular-template" { capabilities = ["read"] }`.
+
+Lỗi được **tách bạch**:
+- `vault: permission denied`: sai quyền hoặc token.
+- `vault: path not found`: path không tồn tại.
+- Lỗi mạng hoặc TLS: in nguyên văn lỗi.
+- Thiếu cấu hình: báo hết các khoá thiếu trong một lỗi.
+
+Không bao giờ bỏ kiểm chứng chỉ TLS. Token không được ghi ra log.
+
+`shortcut:` Vault chỉ được đọc **một lần lúc khởi động**: không gia hạn token, không theo dõi thay đổi, nên đổi secret thì phải restart. Cần đổi cấu hình khi đang chạy thì dùng Vault Agent sidecar, hoặc thêm vòng đọc lại.
+
+Chạy thử với Vault dev bằng Docker:
+```bash
+docker run -d --rm --name vault --cap-add=IPC_LOCK -e VAULT_DEV_ROOT_TOKEN_ID=root-dev -p 127.0.0.1:8200:8200 hashicorp/vault
+curl -H 'X-Vault-Token: root-dev' -X POST 127.0.0.1:8200/v1/secret/data/go-modular-template \
+     -d '{"data":{"AUTH_TOKEN":"vault-app-token-abcdef12"}}'
+VAULT_ADDR=http://127.0.0.1:8200 VAULT_TOKEN=root-dev VAULT_PATHS=go-modular-template go run .
+```
+
+---
+
 ## Luồng một request
 
 ```
@@ -157,7 +212,7 @@ Ví dụ thêm Kafka:
   - topic retry có độ trễ, cộng với DLQ;
   - chưa chuyển được message sang topic retry hoặc DLQ thì **không Ack**.
 
-Làm tương tự với `framework/config/vault/` (cài `config.Source`), `framework/db/postgres/`, `framework/service/grpcx/`.
+Làm tương tự với `framework/db/postgres/`, `framework/service/grpcx/`. Ví dụ đã có sẵn: `framework/config/vault/` cài interface `config.Source` cạnh `config/env`.
 
 Code sinh tự động (protobuf, ABI…) đặt ở một thư mục riêng, ví dụ `define/gen/` hoặc `gen/`, kèm `//go:generate`. Không trộn với code viết tay.
 
