@@ -1,0 +1,22 @@
+# Chỉ gửi vào build context thứ cần để build; không bao giờ gửi secret.
+.git
+.github
+.gitignore
+.dockerignore
+Dockerfile
+README.md
+
+.env
+.env.*
+**/.env
+**/.env.*
+
+.idea
+.vscode
+
+bin
+tmp
+coverage*
+*.out
+*.test
+*.log
